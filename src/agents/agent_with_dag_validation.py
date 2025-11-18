@@ -1,0 +1,288 @@
+"""
+BioPlanner × Snakemake エージェントとDAG検証エンジンの統合例
+エラーをLLMにフィードバックして自己修正させるループを実装
+"""
+
+from dag_validator import DAGValidator, ValidationResult
+from typing import Dict, Optional
+import json
+
+
+class ExperimentPlanningAgent:
+    """実験計画エージェント（DAG検証機能付き）"""
+
+    def __init__(self, max_retries: int = 3):
+        self.max_retries = max_retries
+        self.validator = DAGValidator()
+
+    def phase1_identify_objects(self, input_data: dict) -> dict:
+        """
+        フェーズ1: オブジェクト同定
+        実際の実装ではLLM APIを呼び出す
+        """
+        print("=" * 60)
+        print("フェーズ1: オブジェクト同定エージェント実行中...")
+        print("=" * 60)
+
+        # ここでLLMを呼び出してオブジェクトを同定
+        # 今回はダミーデータを返す
+        result = {
+            "identified_objects": {
+                "initial": [
+                    "objects/initial/ExpA_stock_20uM.reagent",
+                    "objects/initial/tRNA_Ala_10uM.reagent",
+                    "objects/initial/buffer_components.reagent",
+                ],
+                "intermediate": [
+                    "objects/intermediate/ExpA_dilution_series.samples",
+                    "objects/intermediate/reaction_mixes.samples",
+                    "objects/intermediate/incubated_mixes.samples",
+                    "objects/intermediate/gel_after_electrophoresis.gel",
+                ],
+                "final": [
+                    "objects/final/sybr_stained_gel.image",
+                    "objects/final/cbb_stained_gel.image",
+                ],
+            }
+        }
+
+        print("✅ フェーズ1完了")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+
+    def phase2_define_operations(
+        self, input_data: dict, phase1_result: dict, feedback: Optional[str] = None
+    ) -> dict:
+        """
+        フェーズ2: オペレーション定義
+        実際の実装ではLLM APIを呼び出す
+        feedbackがある場合は、それを考慮して再生成
+        """
+        print("=" * 60)
+        print("フェーズ2: オペレーション定義エージェント実行中...")
+        if feedback:
+            print("⚠️ フィードバックあり:")
+            print(feedback)
+        print("=" * 60)
+
+        # ここでLLMを呼び出してオペレーションを定義
+        # 今回はダミーデータを返す
+        result = {
+            "operations": [
+                {
+                    "operation_id": "prepare_buffer",
+                    "text_description": "反応バッファーを調製する",
+                    "input": ["objects/initial/buffer_components.reagent"],
+                    "output": ["objects/intermediate/reaction_buffer.buffer"],
+                },
+                {
+                    "operation_id": "dilute_enzyme",
+                    "text_description": "ExpAを段階希釈する",
+                    "input": ["objects/initial/ExpA_stock_20uM.reagent"],
+                    "output": ["objects/intermediate/ExpA_dilution_series.samples"],
+                },
+                {
+                    "operation_id": "prepare_reactions",
+                    "text_description": "反応液を調製する",
+                    "input": [
+                        "objects/intermediate/ExpA_dilution_series.samples",
+                        "objects/initial/tRNA_Ala_10uM.reagent",
+                        "objects/intermediate/reaction_buffer.buffer",
+                    ],
+                    "output": ["objects/intermediate/reaction_mixes.samples"],
+                },
+                {
+                    "operation_id": "incubate",
+                    "text_description": "37℃で1時間インキュベートする",
+                    "input": ["objects/intermediate/reaction_mixes.samples"],
+                    "output": ["objects/intermediate/incubated_mixes.samples"],
+                },
+                {
+                    "operation_id": "run_electrophoresis",
+                    "text_description": "電気泳動を実行する",
+                    "input": ["objects/intermediate/incubated_mixes.samples"],
+                    "output": ["objects/intermediate/gel_after_electrophoresis.gel"],
+                },
+                {
+                    "operation_id": "stain_with_sybr",
+                    "text_description": "SYBR Safeで染色する",
+                    "input": ["objects/intermediate/gel_after_electrophoresis.gel"],
+                    "output": ["objects/final/sybr_stained_gel.image"],
+                },
+                {
+                    "operation_id": "stain_with_cbb",
+                    "text_description": "CBBで染色する",
+                    "input": ["objects/intermediate/gel_after_electrophoresis.gel"],
+                    "output": ["objects/final/cbb_stained_gel.image"],
+                },
+            ]
+        }
+
+        print("✅ フェーズ2完了")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+
+    def validate_with_retry(
+        self, input_data: dict, phase1_result: dict
+    ) -> tuple[dict, ValidationResult]:
+        """
+        フェーズ2の出力をDAG検証し、エラーがあれば修正を試みる
+        """
+        phase2_result = None
+        validation_result = None
+
+        for attempt in range(self.max_retries):
+            print(f"\n{'=' * 60}")
+            print(f"検証試行 {attempt + 1}/{self.max_retries}")
+            print(f"{'=' * 60}")
+
+            # フィードバックを生成（2回目以降）
+            feedback = None
+            if attempt > 0 and validation_result:
+                feedback = self._generate_feedback(validation_result)
+
+            # フェーズ2を実行
+            phase2_result = self.phase2_define_operations(
+                input_data, phase1_result, feedback
+            )
+
+            # DAG検証
+            self.validator.load_from_phases(phase1_result, phase2_result)
+            validation_result = self.validator.validate()
+
+            print("\n" + "=" * 60)
+            print("DAG検証結果:")
+            print("=" * 60)
+            print(validation_result.to_json())
+
+            if validation_result.valid:
+                print("\n✅ 検証成功！")
+                break
+            else:
+                print(f"\n❌ 検証失敗（{len(validation_result.errors)}個のエラー）")
+                if attempt < self.max_retries - 1:
+                    print("→ エラーをフィードバックして再試行します...")
+
+        return phase2_result, validation_result
+
+    def _generate_feedback(self, validation_result: ValidationResult) -> str:
+        """検証結果から、LLMに渡すフィードバックメッセージを生成"""
+        feedback_lines = [
+            "前回生成したオペレーションには以下のエラーがありました。修正してください:\n"
+        ]
+
+        for i, error in enumerate(validation_result.errors, 1):
+            feedback_lines.append(f"{i}. {error.message}")
+            feedback_lines.append(f"   提案: {error.suggestion}\n")
+
+        return "\n".join(feedback_lines)
+
+    def phase3_generate_procedure(
+        self,
+        input_data: dict,
+        phase1_result: dict,
+        phase2_result: dict,
+        validation_result: ValidationResult,
+    ) -> dict:
+        """
+        フェーズ3: 手順書生成
+        検証済みのオペレーションから、実行可能な手順書を生成
+        """
+        print("\n" + "=" * 60)
+        print("フェーズ3: 手順書生成エージェント実行中...")
+        print("=" * 60)
+
+        # 実行順序を使って手順書を生成
+        execution_order = validation_result.execution_order
+
+        # ここでLLMを呼び出して自然言語の手順書を生成
+        # 今回は簡易版を返す
+        procedure_steps = []
+        for i, op_id in enumerate(execution_order, 1):
+            # オペレーションの詳細を取得
+            op = next(
+                (o for o in phase2_result["operations"] if o["operation_id"] == op_id),
+                None,
+            )
+            if op:
+                procedure_steps.append(
+                    {"id": i, "text": f"ステップ{i}: {op['text_description']}"}
+                )
+
+        result = {"procedure_steps": procedure_steps}
+
+        print("✅ フェーズ3完了")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+
+    def run(self, input_data: dict) -> dict:
+        """エージェント全体を実行"""
+        print("\n" + "🚀" * 30)
+        print("実験計画エージェント開始")
+        print("🚀" * 30 + "\n")
+
+        # フェーズ1: オブジェクト同定
+        phase1_result = self.phase1_identify_objects(input_data)
+
+        # フェーズ2: オペレーション定義（DAG検証付き）
+        phase2_result, validation_result = self.validate_with_retry(
+            input_data, phase1_result
+        )
+
+        if not validation_result.valid:
+            print("\n❌ 最大試行回数に達しましたが、検証に失敗しました。")
+            return {
+                "success": False,
+                "error": "DAG validation failed after maximum retries",
+                "validation_result": validation_result.to_dict(),
+            }
+
+        # フェーズ3: 手順書生成
+        phase3_result = self.phase3_generate_procedure(
+            input_data, phase1_result, phase2_result, validation_result
+        )
+
+        print("\n" + "🎉" * 30)
+        print("実験計画エージェント完了")
+        print("🎉" * 30 + "\n")
+
+        return {"success": True, "output": phase3_result}
+
+
+def main():
+    """使用例"""
+    # 入力データ（LA-Benchの形式）
+    input_data = {
+        "id": "demo_experiment",
+        "input": {
+            "instruction": "EMSA により、RNA 修飾酵素 ExpA と tRNA との結合を評価する。",
+            "mandatory_objects": [
+                "ExpA（20 µM ストック）",
+                "tRNA（10 µM ストック）",
+                "バッファー類",
+            ],
+            "source_protocol_steps": [
+                {
+                    "id": 1,
+                    "text": "酵素と基質を反応溶液中で 37 °C で 1 時間インキュベートする。",
+                },
+                {"id": 2, "text": "6% 非変性ゲルで電気泳動する。"},
+                {"id": 3, "text": "SYBR Safe で RNA を染色する。"},
+                {"id": 4, "text": "CBB でタンパク質を染色する。"},
+            ],
+            "expected_final_states": ["SYBR Safe 染色画像", "CBB 染色画像"],
+        },
+    }
+
+    # エージェント実行
+    agent = ExperimentPlanningAgent(max_retries=3)
+    result = agent.run(input_data)
+
+    print("\n" + "=" * 60)
+    print("最終結果:")
+    print("=" * 60)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
