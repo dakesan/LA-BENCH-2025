@@ -1,64 +1,82 @@
 """
-BioPlanner × Snakemake エージェントとDAG検証エンジンの統合実装
+BioPlanner × Snakemake エージェント (Experiment Planner)
+実験計画の論理的整合性を担保しながら手順書を生成するメインエージェント
 """
 
 import os
 import json
-import time
 from pathlib import Path
-from typing import Dict, Optional, List, Any
-from dag_validator import DAGValidator, ValidationResult
+from typing import Dict, Optional, List, Any, Tuple
 from openai import OpenAI
 import sys
 
 # Add src to path to import tools
 sys.path.append(str(Path(__file__).parent.parent))
+# Import from sibling modules
+# Note: When running as a script, we need to handle imports carefully
+try:
+    from agents.dag_validator import DAGValidator, ValidationResult
+    from agents.prompts import (
+        PHASE1_DESIGN_PROMPT,
+        PHASE1_OBJECTS_PROMPT,
+        PHASE2_OP_DEF_PROMPT,
+        PHASE3_PROC_GEN_PROMPT,
+        FEEDBACK_PROMPT,
+    )
+except ImportError:
+    # Fallback for when running from root
+    from src.agents.dag_validator import DAGValidator, ValidationResult
+    from src.agents.prompts import (
+        PHASE1_DESIGN_PROMPT,
+        PHASE1_OBJECTS_PROMPT,
+        PHASE2_OP_DEF_PROMPT,
+        PHASE3_PROC_GEN_PROMPT,
+        FEEDBACK_PROMPT,
+    )
+
 from tools.fetch_url import fetch_text
-from agents.prompts import PHASE1_OBJ_ID_PROMPT, PHASE2_OP_DEF_PROMPT, PHASE3_PROC_GEN_PROMPT, FEEDBACK_PROMPT
+
 
 class ExperimentPlanningAgent:
     """実験計画エージェント（DAG検証機能付き）"""
 
-    def __init__(self, api_key: str, model_name: str = "gpt-4o", max_retries: int = 3, workspace_dir: str = "workspace"):
+    def __init__(
+        self, api_key: str, model_name: str = "gpt-4o", max_retries: int = 3, workspace_dir: str = "workspace"
+    ):
         self.client = OpenAI(api_key=api_key)
         self.model_name = model_name
         self.max_retries = max_retries
         self.validator = DAGValidator()
         self.workspace_dir = Path(workspace_dir)
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Sub-directories
         (self.workspace_dir / "references").mkdir(exist_ok=True)
 
     def _call_llm(self, system_prompt: str, user_prompt: str, response_format=None) -> Any:
         """LLMを呼び出す共通メソッド"""
         try:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-            
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
             kwargs = {
                 "model": self.model_name,
                 "messages": messages,
                 "temperature": 0.2,
             }
-            
+
             if response_format:
                 kwargs["response_format"] = response_format
 
             response = self.client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content
-            
+
             if response_format:
-                # response_formatを指定した場合はパース済みオブジェクトが返るわけではない（OpenAI Python SDKのバージョンによるが、
-                # ここではjson_object指定を想定して手動パースするか、pydanticモデルを使うか。
-                # 簡易的に json_object モードを使って json.loads する）
                 return json.loads(content)
             return content
 
         except Exception as e:
             print(f"Error calling LLM: {e}")
+            # Retry logic could be added here
             raise
 
     def fetch_references(self, references: List[Dict]) -> str:
@@ -66,55 +84,83 @@ class ExperimentPlanningAgent:
         print("🌐 参考文献を取得中...")
         fetched_summary = []
         for ref in references:
-            url = next((w for w in ref.get("text", "").split() if w.startswith("http")), None)
+            # Extract URL from text (simple heuristic)
+            text = ref.get("text", "")
+            url = next((w for w in text.split() if w.startswith("http")), None)
+
             if url:
                 print(f"  Fetching: {url}")
-                text = fetch_text(url)
-                
-                # Save to workspace
-                ref_id = ref.get("id", "unknown")
-                save_path = self.workspace_dir / "references" / f"ref_{ref_id}.txt"
-                save_path.write_text(text, encoding="utf-8")
-                
-                fetched_summary.append(f"Reference [{ref_id}]: {text[:500]}...")
-        
+                try:
+                    content = fetch_text(url)
+
+                    # Save to workspace
+                    ref_id = ref.get("id", "unknown")
+                    save_path = self.workspace_dir / "references" / f"ref_{ref_id}.txt"
+                    save_path.write_text(content, encoding="utf-8")
+
+                    # Summarize for prompt context (first 2000 chars)
+                    fetched_summary.append(f"Reference [{ref_id}] ({url}):\n{content[:2000]}...")
+                except Exception as e:
+                    print(f"  Failed to fetch {url}: {e}")
+                    fetched_summary.append(f"Reference [{ref_id}]: Failed to fetch content.")
+
         return "\n\n".join(fetched_summary)
 
     def phase1_identify_objects(self, input_data: dict, references_text: str) -> dict:
         """
-        フェーズ1: オブジェクト同定
+        フェーズ1: 実験デザイン抽出とオブジェクト同定
         """
         print("=" * 60)
-        print("フェーズ1: オブジェクト同定エージェント実行中...")
+        print("フェーズ1: 実験デザイン抽出 & オブジェクト同定...")
         print("=" * 60)
 
         instruction = input_data["input"]["instruction"]
         mandatory_objects = input_data["input"]["mandatory_objects"]
-        
-        # プロンプト構築
-        prompt = PHASE1_OBJ_ID_PROMPT.format(
+        source_protocol = input_data["input"].get("source_protocol_steps", [])
+
+        # Step 1.1: デザイン抽出
+        print("  Step 1.1: 実験デザイン抽出中...")
+        design_prompt = PHASE1_DESIGN_PROMPT.format(
             instruction=instruction,
-            mandatory_objects=json.dumps(mandatory_objects, ensure_ascii=False)
+            mandatory_objects=json.dumps(mandatory_objects, ensure_ascii=False),
+            source_protocol=json.dumps(source_protocol, ensure_ascii=False),
         )
         if references_text:
-            prompt += f"\n\n## 参考文献情報\n{references_text}"
+            design_prompt += f"\n\n## 参考文献情報\n{references_text}"
 
-        # LLM呼び出し (JSONモード)
-        result = self._call_llm(
+        design_result = self._call_llm(
             system_prompt="You are a laboratory automation expert. Output JSON.",
-            user_prompt=prompt,
-            response_format={"type": "json_object"}
+            user_prompt=design_prompt,
+            response_format={"type": "json_object"},
         )
-        
-        # ワークスペースに保存
-        (self.workspace_dir / "1_objects.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Save design
+        (self.workspace_dir / "1_1_design.json").write_text(
+            json.dumps(design_result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # Step 1.2: オブジェクト定義
+        print("  Step 1.2: オブジェクト定義中...")
+        objects_prompt = PHASE1_OBJECTS_PROMPT.format(
+            experimental_design=json.dumps(design_result, ensure_ascii=False),
+            mandatory_objects=json.dumps(mandatory_objects, ensure_ascii=False),
+        )
+
+        objects_result = self._call_llm(
+            system_prompt="You are a laboratory automation expert. Output JSON.",
+            user_prompt=objects_prompt,
+            response_format={"type": "json_object"},
+        )
+
+        # Save objects
+        (self.workspace_dir / "1_2_objects.json").write_text(
+            json.dumps(objects_result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         print("✅ フェーズ1完了")
-        return result
+        return objects_result
 
-    def phase2_define_operations(
-        self, input_data: dict, phase1_result: dict, feedback: Optional[str] = None
-    ) -> dict:
+    def phase2_define_operations(self, input_data: dict, phase1_result: dict, feedback: Optional[str] = None) -> dict:
         """
         フェーズ2: オペレーション定義
         """
@@ -131,9 +177,9 @@ class ExperimentPlanningAgent:
         prompt = PHASE2_OP_DEF_PROMPT.format(
             instruction=instruction,
             identified_objects=json.dumps(identified_objects, ensure_ascii=False),
-            source_protocol=json.dumps(source_protocol, ensure_ascii=False)
+            source_protocol=json.dumps(source_protocol, ensure_ascii=False),
         )
-        
+
         if feedback:
             prompt += "\n\n" + FEEDBACK_PROMPT.format(feedback=feedback)
 
@@ -141,18 +187,20 @@ class ExperimentPlanningAgent:
         result = self._call_llm(
             system_prompt="You are a laboratory automation expert. Output JSON.",
             user_prompt=prompt,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
         )
 
         # ワークスペースに保存
-        (self.workspace_dir / "2_operations.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        (self.workspace_dir / "2_operations.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         print("✅ フェーズ2完了")
         return result
 
     def validate_with_retry(
         self, input_data: dict, phase1_result: dict
-    ) -> tuple[dict, ValidationResult]:
+    ) -> Tuple[Optional[dict], Optional[ValidationResult]]:
         """
         フェーズ2の出力をDAG検証し、エラーがあれば修正を試みる
         """
@@ -170,9 +218,7 @@ class ExperimentPlanningAgent:
                 feedback = self._generate_feedback(validation_result)
 
             # フェーズ2を実行
-            phase2_result = self.phase2_define_operations(
-                input_data, phase1_result, feedback
-            )
+            phase2_result = self.phase2_define_operations(input_data, phase1_result, feedback)
 
             # DAG検証
             self.validator.load_from_phases(phase1_result, phase2_result)
@@ -195,9 +241,7 @@ class ExperimentPlanningAgent:
 
     def _generate_feedback(self, validation_result: ValidationResult) -> str:
         """検証結果から、LLMに渡すフィードバックメッセージを生成"""
-        feedback_lines = [
-            "前回生成したオペレーションには以下のエラーがありました。修正してください:\n"
-        ]
+        feedback_lines = ["前回生成したオペレーションには以下のエラーがありました。修正してください:\n"]
 
         for i, error in enumerate(validation_result.errors, 1):
             feedback_lines.append(f"{i}. {error.message}")
@@ -211,7 +255,7 @@ class ExperimentPlanningAgent:
         phase1_result: dict,
         phase2_result: dict,
         validation_result: ValidationResult,
-        references_text: str
+        references_text: str,
     ) -> dict:
         """
         フェーズ3: 手順書生成
@@ -222,7 +266,7 @@ class ExperimentPlanningAgent:
 
         instruction = input_data["input"]["instruction"]
         operations = phase2_result["operations"]
-        
+
         # 実行順序でソート
         execution_order = validation_result.execution_order
         ordered_ops = []
@@ -232,16 +276,14 @@ class ExperimentPlanningAgent:
                 ordered_ops.append(op)
 
         prompt = PHASE3_PROC_GEN_PROMPT.format(
-            instruction=instruction,
-            operations=json.dumps(ordered_ops, ensure_ascii=False),
-            references=references_text
+            instruction=instruction, operations=json.dumps(ordered_ops, ensure_ascii=False), references=references_text
         )
 
         # LLM呼び出し
         result = self._call_llm(
             system_prompt="You are a laboratory automation expert. Output JSON.",
             user_prompt=prompt,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
         )
 
         print("✅ フェーズ3完了")
@@ -249,10 +291,16 @@ class ExperimentPlanningAgent:
 
     def run(self, input_data: dict) -> dict:
         """エージェント全体を実行"""
+        task_id = input_data.get("id", "unknown")
         print("\n" + "🚀" * 30)
-        print(f"実験計画エージェント開始: {input_data.get('id', 'unknown')}")
+        print(f"実験計画エージェント開始: {task_id}")
         print("🚀" * 30 + "\n")
-        
+
+        # Workspace setup for this task
+        self.workspace_dir = Path(f"workspace/{task_id}")
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        (self.workspace_dir / "references").mkdir(exist_ok=True)
+
         # 参考文献取得
         references = input_data["input"].get("references", [])
         references_text = self.fetch_references(references)
@@ -261,17 +309,17 @@ class ExperimentPlanningAgent:
         phase1_result = self.phase1_identify_objects(input_data, references_text)
 
         # フェーズ2: オペレーション定義（DAG検証付き）
-        phase2_result, validation_result = self.validate_with_retry(
-            input_data, phase1_result
-        )
+        phase2_result, validation_result = self.validate_with_retry(input_data, phase1_result)
+
+        if phase2_result is None or validation_result is None:
+            return {
+                "id": task_id,
+                "output": {"procedure_steps": [{"id": 1, "text": "Error: Phase 2 failed to produce results."}]},
+            }
 
         if not validation_result.valid:
             print("\n❌ 最大試行回数に達しましたが、検証に失敗しました。")
-            return {
-                "success": False,
-                "error": "DAG validation failed after maximum retries",
-                "validation_result": validation_result.to_dict(),
-            }
+            print("⚠️ 検証失敗のままフェーズ3に進みます（ベストエフォート）")
 
         # フェーズ3: 手順書生成
         phase3_result = self.phase3_generate_procedure(
@@ -282,49 +330,48 @@ class ExperimentPlanningAgent:
         print("実験計画エージェント完了")
         print("🎉" * 30 + "\n")
 
-        return {"success": True, "output": phase3_result}
+        return {"id": task_id, "output": phase3_result}
 
 
 def main():
-    """使用例"""
+    """CLI実行用"""
+    if len(sys.argv) < 2:
+        print("Usage: python experiment_planner.py <input_jsonl> <output_jsonl>")
+        return
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("❌ OPENAI_API_KEYが設定されていません")
         return
 
-    # 入力データ（LA-Benchの形式）
-    # 実際にはファイルから読み込む
-    input_data = {
-        "id": "demo_experiment",
-        "input": {
-            "instruction": "EMSA により、RNA 修飾酵素 ExpA と tRNA との結合を評価する。",
-            "mandatory_objects": [
-                "ExpA（20 µM ストック）",
-                "tRNA（10 µM ストック）",
-                "バッファー類",
-            ],
-            "source_protocol_steps": [
-                {
-                    "id": 1,
-                    "text": "酵素と基質を反応溶液中で 37 °C で 1 時間インキュベートする。",
-                },
-                {"id": 2, "text": "6% 非変性ゲルで電気泳動する。"},
-                {"id": 3, "text": "SYBR Safe で RNA を染色する。"},
-                {"id": 4, "text": "CBB でタンパク質を染色する。"},
-            ],
-            "expected_final_states": ["SYBR Safe 染色画像", "CBB 染色画像"],
-            "references": []
-        },
-    }
-
-    # エージェント実行
     agent = ExperimentPlanningAgent(api_key=api_key)
-    result = agent.run(input_data)
 
-    print("\n" + "=" * 60)
-    print("最終結果:")
-    print("=" * 60)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    results = []
+    with open(input_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            input_data = json.loads(line)
+            try:
+                result = agent.run(input_data)
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing {input_data.get('id')}: {e}")
+                # Add a placeholder error result
+                results.append(
+                    {"id": input_data.get("id"), "output": {"procedure_steps": [{"id": 1, "text": f"Error: {str(e)}"}]}}
+                )
+
+    # Save results
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        for res in results:
+            f.write(json.dumps(res, ensure_ascii=False) + "\n")
+
+    print(f"Saved results to {output_file}")
 
 
 if __name__ == "__main__":

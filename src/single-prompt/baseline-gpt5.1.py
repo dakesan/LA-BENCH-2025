@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 # Data processing
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 # OpenAI API
 try:
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # Model settings (Responses API)
 MODEL_NAME = "gpt-5.1"
 REASONING_EFFORT = "medium"  # none, minimal, low, medium, high
-MAX_OUTPUT_TOKENS = 4096  # Max tokens for Responses API
+MAX_OUTPUT_TOKENS = 16384  # Max tokens for Responses API (GPT-5.1 supports up to 128k)
 
 # Judge model settings
 JUDGE_MODEL = "gpt-4.1-mini"
@@ -114,12 +114,16 @@ class ExampleSample:
 
 
 class StepModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: int = Field(ge=1, description="ステップ番号")
     text: str = Field(description="実験手順の詳細な説明")
 
 
 class GeneratedOutput(BaseModel):
-    procedure_steps: List[StepModel] = Field(description="実験手順のリスト", min_items=1, max_items=50)
+    model_config = ConfigDict(extra="forbid")
+
+    procedure_steps: List[StepModel] = Field(description="実験手順のリスト", min_length=1, max_length=50)
 
 
 class JudgeOutput(BaseModel):
@@ -292,17 +296,71 @@ def generate_outputs(samples: list[ExampleSample], api_key: str) -> list[dict]:
             # We explicitly set it to "medium" for better quality
             response = client.responses.create(
                 model=MODEL_NAME,
-                input=input_text,
+                input=[
+                    {"role": "system", "content": "あなたは生命科学実験の専門家です。"},
+                    {"role": "user", "content": input_text}
+                ],
                 reasoning={"effort": REASONING_EFFORT},
-                response_format=GeneratedOutput,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "generated_output",
+                        "schema": GeneratedOutput.model_json_schema(),
+                        "strict": True,
+                    }
+                },
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             )
 
-            # Parse structured output
-            parsed: GeneratedOutput = response.parsed_output
+            # Parse structured output from response
+            # Debug: Print response structure for first sample
+            if sm.id == samples[0].id:
+                logger.info(f"Response type: {type(response)}")
+                logger.info(f"Response attributes: {dir(response)}")
+                if hasattr(response, 'output_text'):
+                    logger.info(f"output_text type: {type(response.output_text)}")
+                    logger.info(f"output_text preview: {response.output_text[:200] if response.output_text else 'None'}")
+                if hasattr(response, 'output'):
+                    logger.info(f"output type: {type(response.output)}")
+                    logger.info(f"output length: {len(response.output) if response.output else 0}")
+
+            # Try to get output text
+            output_text = None
+            if hasattr(response, 'output_text') and response.output_text:
+                output_text = response.output_text
+            elif hasattr(response, 'output') and response.output:
+                # Extract text from output array
+                for item in response.output:
+                    if hasattr(item, 'content'):
+                        for content in item.content:
+                            if hasattr(content, 'text'):
+                                output_text = content.text
+                                break
+                    if output_text:
+                        break
+
+            if not output_text:
+                raise ValueError("Could not extract output text from response")
+
+            # Parse JSON with better error handling
+            try:
+                parsed_dict = json.loads(output_text)
+            except json.JSONDecodeError as json_err:
+                logger.error(f"JSON parse error for {sm.id}: {json_err}")
+                logger.error(f"output_text length: {len(output_text)}")
+                logger.error(f"output_text: {output_text}")
+                # Save to file for debugging
+                debug_file = OUTPUT_DIR / f"debug_json_error_{sm.id}.txt"
+                debug_file.parent.mkdir(parents=True, exist_ok=True)
+                debug_file.write_text(output_text, encoding="utf-8")
+                logger.error(f"Saved problematic output to: {debug_file}")
+                raise
+
+            parsed = GeneratedOutput(**parsed_dict)
             steps = [Step(id=s.id, text=s.text) for s in sorted(parsed.procedure_steps, key=lambda x: x.id)][:50]
 
         except Exception as e:
+            logger.error(f"❌ 生成失敗: {sm.id}: {e}")
             print(f"❌ 生成失敗: {sm.id}: {e}")
             steps = []
 
